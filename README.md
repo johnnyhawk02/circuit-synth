@@ -4,6 +4,10 @@ Every module is a real schematic written as a netlist and solved sample by sampl
 Modified Nodal Analysis + Newton-Raphson, trapezoidal capacitors, 4x oversampling.
 No DSP shortcuts inside the modules.
 
+## Live demo
+
+GitHub Pages serves the browser demo from the repo root (`index.html` redirects to `demo/`).
+
 ## Run
 
 ```
