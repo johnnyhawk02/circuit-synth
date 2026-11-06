@@ -15,6 +15,8 @@
 //
 // Works in Node (ES modules) and in the browser / AudioWorklet.
 
+import { K, alloc, buffer, CTX } from './kernel.js';
+
 const VT = 0.025852; // thermal voltage at 27 °C
 const GMIN = 1e-12;  // tiny conductance across every junction, helps convergence
 
@@ -39,122 +41,11 @@ function luSolve(A, n, piv, b) {
   for (let i = n - 1; i >= 0; i--) { let s = b[i]; for (let j = i + 1; j < n; j++) s -= A[i * n + j] * b[j]; b[i] = s / A[i * n + i]; }
 }
 
-// small in-place Gaussian elimination for the per-sample port Newton step
-function smallSolve(J, r, m) {
-  for (let k = 0; k < m; k++) {
-    let p = k, max = Math.abs(J[k * m + k]);
-    for (let i = k + 1; i < m; i++) { const v = Math.abs(J[i * m + k]); if (v > max) { max = v; p = i; } }
-    if (max < 1e-300) return false;
-    if (p !== k) {
-      for (let j = k; j < m; j++) { const t = J[k * m + j]; J[k * m + j] = J[p * m + j]; J[p * m + j] = t; }
-      const t = r[k]; r[k] = r[p]; r[p] = t;
-    }
-    const d = J[k * m + k];
-    for (let i = k + 1; i < m; i++) {
-      const f = J[i * m + k] / d;
-      if (f === 0) continue;
-      for (let j = k + 1; j < m; j++) J[i * m + j] -= f * J[k * m + j];
-      r[i] -= f * r[k];
-    }
-  }
-  for (let i = m - 1; i >= 0; i--) {
-    let s = r[i];
-    for (let j = i + 1; j < m; j++) s -= J[i * m + j] * r[j];
-    r[i] = s / J[i * m + i];
-  }
-  return true;
-}
-
-function smallLU(A, m, piv) {
-  for (let k = 0; k < m; k++) {
-    let p = k, max = Math.abs(A[k * m + k]);
-    for (let i = k + 1; i < m; i++) { const v = Math.abs(A[i * m + k]); if (v > max) { max = v; p = i; } }
-    if (!(max > 1e-300)) return false;
-    piv[k] = p;
-    if (p !== k) for (let j = 0; j < m; j++) { const t = A[k * m + j]; A[k * m + j] = A[p * m + j]; A[p * m + j] = t; }
-    const d = A[k * m + k];
-    for (let i = k + 1; i < m; i++) {
-      const f = (A[i * m + k] /= d);
-      if (f !== 0) for (let j = k + 1; j < m; j++) A[i * m + j] -= f * A[k * m + j];
-    }
-  }
-  return true;
-}
-function smallLUSolve(A, m, piv, b) {
-  for (let k = 0; k < m; k++) { const p = piv[k]; if (p !== k) { const t = b[k]; b[k] = b[p]; b[p] = t; } }
-  for (let i = 1; i < m; i++) { let s = b[i]; const o = i * m; for (let j = 0; j < i; j++) s -= A[o + j] * b[j]; b[i] = s; }
-  for (let i = m - 1; i >= 0; i--) { let s = b[i]; const o = i * m; for (let j = i + 1; j < m; j++) s -= A[o + j] * b[j]; b[i] = s / A[o + i]; }
-}
-
-// SPICE-style junction voltage limiting: stops exp() from blowing up mid-iteration
-function pnjlim(vnew, vold, vt, vcrit) {
-  if (vnew > vcrit && Math.abs(vnew - vold) > 2 * vt) {
-    if (vold > 0) {
-      const arg = 1 + (vnew - vold) / vt;
-      vnew = arg > 0 ? vold + vt * Math.log(arg) : vcrit;
-    } else {
-      vnew = vt * Math.log(vnew / vt);
-    }
-  }
-  return vnew;
-}
-
 // ---------- port kinds ----------
 // Each port: { kind, nv: [[unknownIndex, coef]...] (port voltage), inj: [[row, coef]...] (where f goes),
 //              params }. eval(v) -> sets port.f and port.d (df/dv).
+// (the port equations themselves are evaluated in kernel/kernel.c)
 const EXP = 0, TANH = 1, JFET = 2, JFET3 = 3, ZERO = 4, CLAMP = 5;
-
-// Shichman-Hodges N-JFET drain current for vds >= 0, softplus-smoothed overdrive.
-// returns [id, d id/d vgs, d id/d vds]
-function jfetId(beta, vto, soft, vgs, vds) {
-  const x = (vgs - vto) / soft;
-  const vov = x > 30 ? soft * x : soft * Math.log1p(Math.exp(x));
-  const dvov = x > 30 ? 1 : 1 / (1 + Math.exp(-x));
-  if (vds < vov) return [beta * (2 * vov - vds) * vds, 2 * beta * vds * dvov, 2 * beta * (vov - vds)];
-  return [beta * vov * vov, 2 * beta * vov * dvov, 0];
-}
-
-function evalPort(p, v) {
-  switch (p.kind) {
-    case EXP: {
-      const e = Math.exp(v / p.nvt);
-      p.f = p.is * (e - 1) + GMIN * v;
-      p.d = p.is * e / p.nvt + GMIN;
-      break;
-    }
-    case TANH: {
-      const t = Math.tanh(p.k * (v + p.vos));
-      p.f = p.vsat * t;
-      p.d = p.vsat * p.k * (1 - t * t) + 1e-9;
-      break;
-    }
-    case JFET3: { // port voltage = vds; partner port carries vgs
-      const vgs = p.partner.v, vds = v;
-      let r;
-      if (vds >= 0) r = jfetId(p.beta, p.vto, p.soft, vgs, vds);
-      else { const q = jfetId(p.beta, p.vto, p.soft, vgs - vds, -vds); r = [-q[0], -q[1], q[1] + q[2]]; }
-      p.f = r[0] + GMIN * vds; p.d = r[2] + GMIN; p.xd = r[1];
-      break;
-    }
-    case ZERO: p.f = 0; p.d = 0; break;
-    case CLAMP: { // soft rail clamp: conducts only beyond ±vsat (smooth hinge, slope k siemens)
-      const s = p.soft, a = (v - p.vsat) / s, b = (-v - p.vsat) / s;
-      const spa = a > 30 ? a : Math.log1p(Math.exp(a)), spb = b > 30 ? b : Math.log1p(Math.exp(b));
-      const sa = a > 30 ? 1 : 1 / (1 + Math.exp(-a)), sb = b > 30 ? 1 : 1 / (1 + Math.exp(-b));
-      p.f = p.k * s * (spa - spb); p.d = p.k * (sa + sb) + GMIN;
-      break;
-    }
-    case JFET: { // square law in saturation, softplus-smoothed at pinch-off
-      const x = (v - p.vto) / p.soft;
-      const sp = x > 30 ? x : Math.log1p(Math.exp(x));
-      const sig = x > 30 ? 1 : 1 / (1 + Math.exp(-x));
-      const u = p.soft * sp;
-      p.f = p.beta * u * u + GMIN * v;
-      p.d = 2 * p.beta * u * sig + GMIN;
-      break;
-    }
-  }
-}
 
 // all ports share one shape so the hot loop stays monomorphic
 class Port {
@@ -181,7 +72,7 @@ export class Circuit {
     this.probes = [];
     // every field the hot path touches exists from the start, in one order, so all circuits
     // share a hidden class and property loads stay monomorphic
-    this.opamps = []; this._oaN = 0; this.watches = null; this._st = null; this.dirty = true;
+    this.opamps = []; this._oaN = 0; this.vars = []; this.cache = new Map(); this.watches = null; this._st = null; this.dirty = true;
     this.n = 0; this.m = 0; this.ns = 0; this.nc = 0; this.k = 0; this.ports = null; this.cross = null;
     this.e = null; this.vp = null; this.fp = null; this.pl = null; this.J = null; this.r = null;
     this.vSave = null; this.piv = null; this.dd = null; this.dv = null; this.vPrev = null; this.tolv = null;
@@ -190,6 +81,10 @@ export class Circuit {
     this.X = null; this.cols = 0; this.P = null; this.Q = null; this.CP = null;
     this.hold = 0; this.startLevel = 0; this.deepest = 0; this.chord = false; this.hasPrev = false;
     this.h = 0; this.maxLevel = 8;
+    this.Ja = null; this.act = null; this.pos = null; this.na = 0; this.ra = null; this.ddF = null;
+    this.ctx = 0; this.off = null; this.buf = null; this.ci32 = null; this.f64n = null; this.i32n = null;
+    this.wP = null; this.wQ = null; this.wCP = null; this.wqmax = null; this.capGeq = null; this.capIeq = null; this.capV = null; this.capI = null;
+    this.isAct = null; this.xdF = null; this.keep = null; this.qmax = null; this.cfg = null;
   }
 
   node(name) {
@@ -197,12 +92,19 @@ export class Circuit {
     return this.nodeIndex.get(name);
   }
   branch() { return this.branchCount++; }
+  // a part whose value can change (pot, switch, range cap): its value is part of the key
+  // that the cached matrices are filed under, so toggling back to an earlier setting
+  // (a gate switch, say) reuses the matrices instead of rebuilding them
+  _variable(x) {
+    if (!x.isVar) { x.isVar = true; this.vars.push(x); }
+    this.dirty = true;
+  }
 
   // --- component helpers (nodes are names, '0' is ground) ---
   R(a, b, ohms) {
     const r = { a: this.node(a), b: this.node(b), g: 1 / ohms, circuit: this };
     // r.set(ohms) changes the value later (pots, switches); the matrices rebuild on the next step
-    r.set = ohms => { r.g = 1 / ohms; this.dirty = true; };
+    r.set = ohms => { const g = 1 / ohms; if (g === r.g) return; r.g = g; this._variable(r); };
     this.resistors.push(r);
     return r;
   }
@@ -219,7 +121,7 @@ export class Circuit {
     const c = { a: this.node(a), b: this.node(b), c: farads, v: v0, i: 0, ieq: 0, geq: 0,
       be: opts.be ?? this.integrator === 'be' };
     // c.set(farads) swaps the part (e.g. a range switch); charge is kept, current reset
-    c.set = f => { c.c = f; c.i = 0; this.dirty = true; };
+    c.set = f => { if (f === c.c) return; c.c = f; c.i = 0; if (this.capI) this.capI[c.idx] = 0; this._variable(c); };
     this.caps.push(c);
     return c;
   }
@@ -335,24 +237,13 @@ export class Circuit {
     this.ns = this.sources.length;
     this.nc = this.caps.length;
     this.k = this.ns + this.nc;
-    this.e = new Float64Array(this.k);
-    this.vp = new Float64Array(this.m);   // port voltages
-    this.fp = new Float64Array(this.m);   // port currents
-    this.pl = new Float64Array(this.m);   // linear part of port voltages this step
-    this.J = new Float64Array(this.m * this.m);
-    this.r = new Float64Array(this.m);
     this.vSave = new Float64Array(this.m);
-    this.piv = new Int32Array(this.m);
-    this.dd = new Float64Array(this.m);
-    this.dv = new Float64Array(this.m);
     this.vPrev = new Float64Array(this.m);
-    // convergence tolerance per port, in port volts: 1 µV on junctions; for op-amp inputs
-    // scaled by the gain so the output is good to ~1 µV
-    this.tolv = Float64Array.from(this.ports, p => p.kind === TANH ? 1e-4 / Math.max(1, p.vsat * p.k) : 1e-5);
+    this._layout();
     this.predict = true;   // linear extrapolation of the port voltages (about halves the iterations)
-    this.luOK = false;
-    this.stats = { steps: 0, iters: 0, failures: 0, rebuilds: 0, substeps: 0, factors: 0, fast: 0 };
-    this.eLast = new Float64Array(this.k);
+    const self = this;
+    this.stats = { steps: 0, failures: 0, rebuilds: 0, substeps: 0, fast: 0,
+      get iters() { return self.ci32[self.ctx / 4 + 7]; }, get factors() { return self.ci32[self.ctx / 4 + 8]; } };
     this.levels = []; this.dcLevel = null; this.cur = null; this.level = 0;
     this.X = null; this.cols = 0; this.P = null; this.Q = null; this.CP = null;
     this.hold = 0; this.startLevel = 0; this.deepest = 0; this.chord = false; this.hasPrev = false;
@@ -360,6 +251,44 @@ export class Circuit {
     this.dirty = true;
     this.maxLevel = 8;   // smallest sub-step h/256
     return this;
+  }
+
+  // Lay this circuit's arrays out in the kernel's memory and fill the constant parts.
+  _layout() {
+    const { m, k, nc } = this, cols = k + m, nx = this.cross.length;
+    const f64 = { P: m * k, Q: m * m, CP: nc * cols, qmax: m, e: k, eLast: k, vp: m, fp: m, pl: m, dd: m, dv: m,
+      r: m, Ja: m * m, ra: m, ddF: m, tolv: m, xdF: nx, is: m, nvt: m, vcrit: m, vsat: m, kk: m, vos: m,
+      tanhStep: m, beta: m, vto: m, soft: m, xd: m, capGeq: nc, capIeq: nc, capV: nc, capI: nc };
+    const i32 = { act: m, pos: m, piv: m, keep: m, isAct: m, kind: m, partner: m, crossI: nx, crossX: nx, capBe: nc };
+    this.ctx = alloc(CTX.length * 4);
+    this.off = {};
+    for (const [name, n] of Object.entries(f64)) this.off[name] = alloc(Math.max(1, n) * 8);
+    for (const [name, n] of Object.entries(i32)) this.off[name] = alloc(Math.max(1, n) * 4);
+    this.f64n = f64; this.i32n = i32;
+    this._views();
+    const c = this.ci32, b = this.ctx / 4;
+    c[b] = m; c[b + 1] = k; c[b + 2] = nc; c[b + 3] = cols; c[b + 4] = nx;
+    CTX.forEach((name, i) => { if (name in this.off) c[b + i] = this.off[name]; });
+    const P = this.ports;
+    P.forEach((p, i) => {
+      this.kind[i] = p.kind; this.partner[i] = p.partner ? P.indexOf(p.partner) : 0;
+      this.is[i] = p.is; this.nvt[i] = p.nvt; this.vcrit[i] = p.vcrit; this.vsat[i] = p.vsat; this.kk[i] = p.k;
+      this.vos[i] = p.vos; this.tanhStep[i] = p.tanhStep; this.beta[i] = p.beta; this.vto[i] = p.vto; this.soft[i] = p.soft;
+      // convergence tolerance per port, in port volts: 10 µV on junctions; for op-amp inputs
+      // scaled by the gain so the output is good to ~0.1 mV
+      this.tolv[i] = p.kind === TANH ? 1e-4 / Math.max(1, p.vsat * p.k) : 1e-5;
+    });
+    this.cross.forEach((x, j) => { this.crossI[j] = x.i; this.crossX[j] = x.x; this.keep[x.i] = 1; this.keep[x.x] = 1; });
+    this.caps.forEach((cp, i) => { cp.idx = i; this.capV[i] = cp.v; this.capI[i] = cp.i; this.capBe[i] = cp.be ? 1 : 0; });
+  }
+  // (re)make the typed-array views; needed again whenever the kernel memory grows
+  _views() {
+    const buf = this.buf = buffer();
+    this.ci32 = new Int32Array(buf);
+    const W = { P: 'wP', Q: 'wQ', CP: 'wCP', qmax: 'wqmax' };   // the current level's matrices
+    for (const [name, n] of Object.entries(this.f64n)) this[W[name] || name] = new Float64Array(buf, this.off[name], n);
+    for (const [name, n] of Object.entries(this.i32n)) this[name] = new Int32Array(buf, this.off[name], n);
+    this.cur = null;   // level matrices must be copied in again
   }
 
   setSampleRate(sr) { this.h = 1 / sr; this.dirty = true; }
@@ -415,107 +344,55 @@ export class Circuit {
     const CP = new Float64Array(nc * cols);
     this.caps.forEach((c, i) => rowOf([[c.a, 1], [c.b, -1]], CP.subarray(i * cols, (i + 1) * cols), 0, cols));
     this.stats.rebuilds++;
-    return { h, X, cols, P, Q, CP, geq };
+    // largest |Q| in each column: a port with slope d moves the others by at most qmax·d
+    const qmax = new Float64Array(m);
+    for (let i = 0; i < m; i++) for (let j = 0; j < m; j++) qmax[j] = Math.max(qmax[j], Math.abs(Q[i * m + j]));
+    return { h, X, cols, P, Q, CP, geq, qmax };
   }
 
   // Switch to the matrices for step size h / 2^level (0 = full step, -1 = DC).
   _use(level) {
-    if (this.dirty) { this.levels = []; this.dcLevel = null; this.dirty = false; this.cur = null; }
+    if (this.buf !== buffer()) this._views();
+    if (this.dirty) this._lookup();
     let L;
-    if (level < 0) L = this.dcLevel ||= this._build(0);
+    if (level < 0) L = this.cfg.dc ||= this._build(0);
     else L = this.levels[level] ||= this._build(this.h / (1 << level));
     if (L === this.cur) return;
     this.X = L.X; this.cols = L.cols; this.P = L.P; this.Q = L.Q; this.CP = L.CP;
+    this.wP.set(L.P); this.wQ.set(L.Q); this.wCP.set(L.CP); this.wqmax.set(L.qmax);
     // geq changed: re-derive each capacitor's history source from its state (v, i)
+    const { capGeq, capIeq, capV, capI } = this;
     for (let i = 0; i < this.nc; i++) {
-      const c = this.caps[i];
-      c.geq = L.geq[i];
-      c.ieq = level < 0 ? 0 : (c.be ? c.geq * c.v : c.geq * c.v + c.i);
+      const g = capGeq[i] = L.geq[i];
+      capIeq[i] = level < 0 ? 0 : (this.caps[i].be ? g * capV[i] : g * capV[i] + capI[i]);
     }
     this.cur = L;
     this.level = level;
-    this.luOK = false;
   }
-  rebuild() { this.dirty = true; this._use(this.level); }
+  rebuild() { this.cache.clear(); this.dirty = true; this._use(this.level); }
+  // find (or start) the matrix set for the current part values; keeps the 16 most recent
+  _lookup() {
+    let key = String(this.h);
+    for (const x of this.vars) key += ',' + (x.g ?? x.c);
+    let set = this.cache.get(key);
+    if (set) this.cache.delete(key);
+    else {
+      set = { levels: [], dc: null };
+      if (this.cache.size >= 16) this.cache.delete(this.cache.keys().next().value);
+    }
+    this.cache.set(key, set);
+    this.levels = set.levels; this.cfg = set;
+    this.dirty = false; this.cur = null;
+  }
 
   _loadE() {
-    const e = this.e;
-    for (let j = 0; j < this.ns; j++) e[j] = this.sources[j].volts;
-    for (let j = 0; j < this.nc; j++) e[this.ns + j] = this.caps[j].ieq;
+    const e = this.e, src = this.sources;
+    for (let j = 0; j < this.ns; j++) e[j] = src[j].volts;
+    K.load_caps(this.ctx, this.ns);
   }
 
-  // Newton on the port vector. Returns true if converged.
-  // circuit.chord = true reuses the factored Jacobian across iterations and samples and only
-  // refactors when convergence slows down (off by default: measured slower on these circuits).
-  newton(maxIter = 60) {
-    const { m, k, P, Q, J, r, vp, fp, pl, e, ports, cross, piv, dd, tolv, dv } = this;
-    for (let i = 0; i < m; i++) {
-      let s = 0; const o = i * k;
-      for (let j = 0; j < k; j++) s += P[o + j] * e[j];
-      pl[i] = s;
-    }
-    if (m === 0) return true;
-    let prevErr = Infinity, refactor = !this.luOK || !this.chord;
-    // (non-chord: refactor at the first iteration, then reuse for small corrections)
-    for (let it = 0; it < maxIter; it++) {
-      for (let i = 0; i < m; i++) ports[i].v = vp[i];
-      for (let i = 0; i < m; i++) { const p = ports[i]; evalPort(p, vp[i]); fp[i] = p.f; dd[i] = p.d; }
-      // residual F = v - pl - Q f
-      for (let i = 0; i < m; i++) {
-        let s = 0; const o = i * m;
-        for (let j = 0; j < m; j++) s += Q[o + j] * fp[j];
-        r[i] = -(vp[i] - pl[i] - s);
-      }
-      this.stats.iters++;
-      let fresh = false;
-      if (refactor) {
-        // Jacobian I - Q D (D diagonal plus a few cross terms), LU-factored in place
-        for (let i = 0; i < m; i++) {
-          const o = i * m;
-          for (let j = 0; j < m; j++) J[o + j] = -Q[o + j] * dd[j];
-          for (let c = 0; c < cross.length; c++) J[o + cross[c].x] -= Q[o + cross[c].i] * ports[cross[c].i].xd;
-          J[o + i] += 1;
-        }
-        if (!smallLU(J, m, piv)) { this.luOK = false; break; }
-        this.luOK = true; fresh = true; refactor = false;
-        this.stats.factors++;
-      }
-      smallLUSolve(J, m, piv, r);
-      let converged = true, err = 0;
-      for (let i = 0; i < m; i++) {
-        const p = ports[i], kind = p.kind, step = r[i], old = vp[i];
-        let vn = old + step;
-        if (kind === EXP) vn = pnjlim(vn, old, p.nvt, p.vcrit);
-        else if (kind === TANH) { const lim = p.tanhStep; if (step > lim) vn = old + lim; else if (step < -lim) vn = old - lim; }
-        else { const lim = kind === CLAMP ? 0.5 : 1; if (step > lim) vn = old + lim; else if (step < -lim) vn = old - lim; }
-        const d = vn - old, ad = Math.abs(d);
-        if (!(ad <= tolv[i])) converged = false;
-        if (ad > err) err = ad;
-        dv[i] = d;
-        vp[i] = vn;
-      }
-      // a node fed only by transistor currents (a diff-pair tail) makes the port equations
-      // ill-conditioned: round-off then sets a noise floor ~1e-7 V. Stagnation below 2 µV
-      // is accepted as converged.
-      if (!converged && err < 2e-6 && err > 0.25 * prevErr) converged = true;
-      // slow contraction with a stale Jacobian: refactor on the next iteration
-      // the Jacobian is factored on the first iteration of every sample; later iterations
-      // (usually just the confirming one) reuse it unless convergence is slow
-      if (!converged && (it > 0 ? err > 0.1 * prevErr : (this.chord ? err > 1e-3 : err > 1e-2))) refactor = true;
-      prevErr = err;
-      if (converged) {
-        // the last update was tiny: move the port currents along their slopes instead of
-        // re-evaluating every exp/tanh
-        for (let i = 0; i < m; i++) { const p = ports[i]; p.v = vp[i]; fp[i] += dd[i] * dv[i]; p.f = fp[i]; }
-        for (let c = 0; c < cross.length; c++) { const ci = cross[c].i; fp[ci] += ports[ci].xd * dv[cross[c].x]; ports[ci].f = fp[ci]; }
-        return true;
-      }
-    }
-    for (let i = 0; i < m; i++) ports[i].v = vp[i];
-    for (let i = 0; i < m; i++) { evalPort(ports[i], vp[i]); fp[i] = ports[i].f; }
-    this.luOK = false;
-    return false;
-  }
+  // Newton on the port vector (in the WebAssembly kernel). Returns true if converged.
+  newton(maxIter = 60) { return K.newton(this.ctx, maxIter) === 1; }
 
   // value of row vector R (length k+m) against current excitation and port currents
   _read(R, o, e) {
@@ -527,18 +404,9 @@ export class Circuit {
     return s;
   }
 
-  _acceptCaps(dc = false) {
-    // keep the excitation this solve used, so v() after step() reads the same solution
-    this.eLast.set(this.e);
-    const cols = this.cols, CP = this.CP, e = this.e;
-    for (let i = 0; i < this.nc; i++) {
-      const c = this.caps[i];
-      const v = this._read(CP, i * cols, e);
-      c.i = dc ? 0 : c.geq * v - c.ieq;
-      c.v = v;
-      c.ieq = dc ? 0 : (c.be ? c.geq * c.v : c.geq * c.v + c.i);
-    }
-  }
+  // capacitor states from the accepted solution; also keeps the excitation this solve used,
+  // so v() after step() reads the same solution
+  _acceptCaps(dc = false) { K.accept_caps(this.ctx, dc ? 1 : 0); }
 
   // Solve the DC operating point (caps open) by ramping supplies in.
   dcop() {
@@ -580,16 +448,15 @@ export class Circuit {
   _save() {
     const st = this._st ||= { vp: new Float64Array(this.m), cv: new Float64Array(this.nc), ci: new Float64Array(this.nc), e: new Float64Array(this.k) };
     st.vp.set(this.vp); st.e.set(this.eLast);
-    for (let i = 0; i < this.nc; i++) { st.cv[i] = this.caps[i].v; st.ci[i] = this.caps[i].i; }
+    st.cv.set(this.capV); st.ci.set(this.capI);
     st.level = this.level;
   }
   _restore() {
     const st = this._st;
     this.vp.set(st.vp); this.eLast.set(st.e);
-    for (let i = 0; i < this.nc; i++) {
-      const c = this.caps[i]; c.v = st.cv[i]; c.i = st.ci[i];
-      c.ieq = c.be ? c.geq * c.v : c.geq * c.v + c.i;
-    }
+    this.capV.set(st.cv); this.capI.set(st.ci);
+    const { capGeq, capIeq, capV, capI } = this;
+    for (let i = 0; i < this.nc; i++) capIeq[i] = this.caps[i].be ? capGeq[i] * capV[i] : capGeq[i] * capV[i] + capI[i];
   }
 
   step() {
@@ -656,7 +523,7 @@ export class Circuit {
   }
   vNode(idx) {
     if (idx < 0) return 0;
-    if (this.dirty) this._use(this.level);
+    if (this.dirty || this.buf !== buffer()) this._use(this.level);
     return this._read(this.X, idx * this.cols, this.eLast);
   }
 }
