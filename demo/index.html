@@ -3,72 +3,182 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Component-level synth prototype</title>
+<title>Moog Circuit Patch</title>
 <style>
-  :root { --bg:#f6f5f2; --fg:#1d1d1b; --muted:#6b6a66; --line:#d8d6d0; --accent:#c4532d; --cv:#3a6ea5; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --fg:#ecebe7; --muted:#9a9993; --line:#33322f; --accent:#e8774f; --cv:#7aa7d9; } }
+  :root { --bg:#f4f2ec; --panel:#fbfaf6; --fg:#1d1d1b; --muted:#6b6a66; --line:#d8d5cc; --accent:#c4532d; --cv:#3a6ea5; --on:#2f7d4f; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --panel:#1d1d1b; --fg:#ecebe7; --muted:#9a9993; --line:#34332f; --accent:#e8774f; --cv:#7aa7d9; --on:#5fbf86; } }
+  * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
-  main { max-width:820px; margin:0 auto; padding:24px 16px; }
-  h1 { font-size:20px; margin:0 0 4px; } p { color:var(--muted); margin:0 0 16px; }
-  .controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:16px; }
-  label { display:flex; flex-direction:column; font-size:13px; color:var(--muted); gap:4px; }
-  input[type=range] { width:100%; accent-color:var(--accent); }
+  main { max-width:980px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:21px; margin:0 0 4px; }
+  p.lead { color:var(--muted); margin:0 0 18px; max-width:760px; }
+  .bar { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:16px; }
   button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:10px 18px; font-size:15px; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); }
   button:disabled { opacity:.5; cursor:default; }
-  canvas { width:100%; height:220px; border:1px solid var(--line); border-radius:6px; display:block; margin-top:16px; }
-  #status { font-variant-numeric:tabular-nums; color:var(--muted); margin-left:12px; }
+  select { font:inherit; padding:8px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:var(--fg); }
+  #status { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .meter { width:120px; height:8px; border-radius:4px; background:var(--line); overflow:hidden; display:inline-block; vertical-align:middle; }
+  .meter i { display:block; height:100%; width:0; background:var(--on); transition:width .2s; }
+  .modules { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+  section h2 { font-size:14px; margin:0 0 2px; letter-spacing:.02em; }
+  section .sub { font-size:12px; color:var(--muted); margin:0 0 10px; }
+  label { display:flex; flex-direction:column; font-size:13px; color:var(--muted); gap:2px; margin-bottom:8px; }
+  label span { display:flex; justify-content:space-between; }
+  label output { color:var(--fg); font-variant-numeric:tabular-nums; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .seq { margin-top:12px; }
+  .steps { display:grid; grid-template-columns:repeat(8,1fr); gap:6px; }
+  .step { border:1px solid var(--line); border-radius:6px; padding:6px 4px; text-align:center; background:var(--bg); transition:border-color .05s; }
+  .step.now { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .step input[type=range] { writing-mode: vertical-lr; direction: rtl; width:22px; height:90px; }
+  .step .n { font-size:12px; font-variant-numeric:tabular-nums; display:block; }
+  .step button { padding:2px 0; width:100%; font-size:11px; margin-top:4px; background:var(--line); color:var(--fg); }
+  .step button.on { background:var(--on); color:#fff; }
+  .seqctl { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-top:10px; }
+  canvas { width:100%; height:180px; border:1px solid var(--line); border-radius:8px; display:block; margin-top:12px; background:var(--panel); }
   .legend span { display:inline-block; margin-right:16px; font-size:13px; color:var(--muted); }
   .legend i { display:inline-block; width:12px; height:3px; vertical-align:middle; margin-right:6px; }
+  details { margin-top:18px; color:var(--muted); font-size:14px; }
+  details li { margin-bottom:4px; }
+  @media (max-width:560px) { .steps { grid-template-columns:repeat(4,1fr); } }
 </style>
 </head>
 <body>
 <main>
-  <h1>Component-level synth prototype</h1>
-  <p>Sine → discrete BJT differential-pair VCA → op-amp mixer, with the VCA's CV coming from an op-amp integrator + Schmitt-trigger LFO. Every part after the sine is solved as a circuit (MNA + Newton-Raphson, 4x oversampled).</p>
-  <div class="controls">
-    <label>Tone <output id="toneV">220 Hz</output><input id="tone" type="range" min="55" max="880" value="220"></label>
-    <label>LFO rate resistor <output id="rateV">100 kΩ</output><input id="rate" type="range" min="20" max="500" value="100"></label>
-    <label>Input level (drives the pair into tanh) <output id="levelV">5.0 V</output><input id="level" type="range" min="0.5" max="10" step="0.5" value="5"></label>
-    <label>Length <output id="secsV">3 s</output><input id="secs" type="range" min="1" max="8" value="3"></label>
+  <h1>Moog modular patch, solved at component level</h1>
+  <p class="lead">A step sequencer plays a discrete saw-core VCO into the Moog 904A transistor-ladder filter and the 902 VCA, both shaped by a 911 envelope. Every transistor, diode, JFET, resistor and capacitor from the original Moog schematics is solved live in your browser (modified nodal analysis + Newton), no DSP shortcuts.</p>
+  <div class="bar">
+    <button id="go">Start</button>
+    <select id="quality" title="Oversampling">
+      <option value="eco">Eco: VCO 2x, filter 1x</option>
+      <option value="hq">HQ: VCO 4x, filter 2x</option>
+    </select>
+    <span id="status">Stopped</span>
+    <span title="Share of the audio thread used by the circuit solver">CPU <span class="meter"><i id="cpu"></i></span> <span id="cpuv"></span></span>
   </div>
-  <button id="go">Render &amp; play</button><span id="status"></span>
-  <canvas id="scope" width="1640" height="440"></canvas>
-  <div class="legend"><span><i style="background:var(--accent)"></i>audio out</span><span><i style="background:var(--cv)"></i>LFO → VCA CV (0–10.5 V)</span></div>
+
+  <div class="modules">
+    <section>
+      <h2>VCO</h2><p class="sub">expo pair, op-amp integrator, Schmitt comparator, JFET reset</p>
+      <label><span>Tune <output id="tuneV"></output></span><input id="tune" type="range" min="-12" max="12" step="0.1" value="0"></label>
+      <label><span>Transpose <output id="transposeV"></output></span><input id="transpose" type="range" min="-12" max="24" step="1" value="0"></label>
+    </section>
+    <section>
+      <h2>904A low pass filter</h2><p class="sub">Q6 expo + 4-stage ladder Q7–Q16, matched pairs</p>
+      <label><span>Fixed control (cutoff) <output id="cutoffV"></output></span><input id="cutoff" type="range" min="0" max="1" step="0.005" value="0.45"></label>
+      <label><span>Regeneration <output id="resonanceV"></output></span><input id="resonance" type="range" min="0" max="1" step="0.005" value="0.4"></label>
+      <label><span>Envelope → control input <output id="envAmtV"></output></span><input id="envAmt" type="range" min="0" max="1" step="0.01" value="0.5"></label>
+      <label><span>Sequencer CV → control input <output id="kbdV"></output></span><input id="kbd" type="range" min="0" max="1" step="0.01" value="0.5"></label>
+      <label><span>Range switch S1 <output id="rangeV"></output></span><input id="range" type="range" min="0" max="2" step="1" value="2"></label>
+    </section>
+    <section>
+      <h2>911 envelope</h2><p class="sub">10 µF timing cap, 1 MΩ pots, flip-flop + comparator</p>
+      <label><span>T1 attack <output id="attackV"></output></span><input id="attack" type="range" min="0" max="1" step="0.005" value="0.05"></label>
+      <label><span>T2 decay <output id="decayV"></output></span><input id="decay" type="range" min="0" max="1" step="0.005" value="0.35"></label>
+      <label><span>Esus sustain <output id="sustainV"></output></span><input id="sustain" type="range" min="0" max="1" step="0.005" value="0.3"></label>
+      <label><span>T3 release <output id="releaseV"></output></span><input id="release" type="range" min="0" max="1" step="0.005" value="0.25"></label>
+    </section>
+    <section>
+      <h2>902 VCA</h2><p class="sub">Q10 expo, Q8/Q9 gain pair, Q11/Q12 output pair</p>
+      <label><span>Output level <output id="levelV"></output></span><input id="level" type="range" min="0" max="0.6" step="0.01" value="0.2"></label>
+      <p class="sub">The 911 drives control input 1; fixed control is fully off, so the VCA only opens with the envelope.</p>
+    </section>
+  </div>
+
+  <section class="seq">
+    <h2>Sequencer</h2><p class="sub">8 steps of 16th notes, 1 V/octave CV (0 V = C2) and an S-trigger gate</p>
+    <div class="steps" id="steps"></div>
+    <div class="seqctl">
+      <label><span>Tempo <output id="tempoV"></output></span><input id="tempo" type="range" min="40" max="200" step="1" value="120"></label>
+      <label><span>Gate length <output id="gateLenV"></output></span><input id="gateLen" type="range" min="0.05" max="0.95" step="0.01" value="0.5"></label>
+    </div>
+  </section>
+
+  <canvas id="scope" width="1880" height="360"></canvas>
+  <div class="legend"><span><i style="background:var(--accent)"></i>audio out</span><span><i style="background:var(--cv)"></i>911 output (0–6 V)</span></div>
+
+  <details>
+    <summary>What is simulated, and what was assumed</summary>
+    <ul>
+      <li>904A (drawing 1149): input buffer Q22/Q23, adder (as an op-amp macro), Q6 exponential converter, ladder Q7–Q16 on the 680/220/220/220/68 Ω bias chain with 1.2/0.3/0.075 µF range caps, output buffer Q17–Q21. The scan's regeneration connection would not resonate as drawn, so it is taken from the opposite output phase (Q20).</li>
+      <li>902 (fig. 9, EXP mode): adder, Q10 expo, Q6/Q7 input pair, Q8/Q9 gain pair, Q11/Q12 PNP output with Q13 current source. OUTPUT BIAS is trimmed to 0 V at start-up, as in the alignment procedure.</li>
+      <li>911 (fig. 17): S-trigger switch, Q1 attack / Q3 release / Q2 decay switches, Q8 sustain follower, Q11–Q14 flip-flop, Q9/Q10 comparator, Q5 2N4303 JFET follower. Solved at 6 kHz; flip-flop transistors get 1 nF junction capacitance so their flips can be sub-stepped.</li>
+      <li>VCO: not a Moog module. A textbook saw core: matched expo pair with an op-amp reference, op-amp integrator, Schmitt comparator and JFET reset.</li>
+      <li>Modules are joined by ideal voltage ports (patch cables), and the sequencer is digital.</li>
+    </ul>
+  </details>
 </main>
 <script type="module">
 const $ = id => document.getElementById(id);
-const fmt = { tone: v => v + ' Hz', rate: v => v + ' kΩ  (≈ ' + (500 / v).toFixed(1) + ' Hz)', level: v => (+v).toFixed(1) + ' V', secs: v => v + ' s' };
-for (const k in fmt) { const upd = () => $(k + 'V').textContent = fmt[k]($(k).value); $(k).oninput = upd; upd(); }
-const sr = 48000;
-let ctx;
-$('go').onclick = () => {
-  ctx ||= new AudioContext({ sampleRate: sr });
-  $('go').disabled = true;
-  const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-  w.onmessage = e => {
-    if (e.data.progress !== undefined) { $('status').textContent = 'Solving circuit… ' + Math.round(e.data.progress * 100) + '%'; return; }
-    const { out, cv, ms } = e.data;
-    $('status').textContent = `Solved ${$('secs').value} s in ${(ms / 1000).toFixed(1)} s`;
-    draw(out, cv);
-    const buf = ctx.createBuffer(1, out.length, sr); buf.copyToChannel(out, 0);
-    const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start();
-    src.onended = () => ($('go').disabled = false);
-    w.terminate();
-  };
-  w.postMessage({ sampleRate: sr, seconds: +$('secs').value, toneHz: +$('tone').value, lfoRateOhms: $('rate').value * 1e3, inputVolts: +$('level').value });
+const pct = v => Math.round(v * 100) + '%';
+const fmt = {
+  tune: v => (+v).toFixed(1) + ' st', transpose: v => v + ' st', cutoff: pct, resonance: pct, envAmt: pct, kbd: pct,
+  range: v => ['1 (1.2 µF)', '2 (0.3 µF)', '3 (0.075 µF)'][v], attack: pct, decay: pct, sustain: pct, release: pct,
+  level: pct, tempo: v => v + ' bpm', gateLen: pct,
 };
-function draw(out, cv) {
+const NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const noteName = n => NAMES[((n % 12) + 12) % 12] + (2 + Math.floor(n / 12));
+let steps = [0, 12, 0, 10, 0, 7, 3, 12].map(n => ({ note: n, on: true }));
+let node, ctx;
+const send = o => node?.port.postMessage({ set: o });
+const params = () => {
+  const o = { steps };
+  for (const k in fmt) o[k] = k === 'range' ? +$(k).value : +$(k).value;
+  return o;
+};
+for (const k in fmt) {
+  const el = $(k), upd = () => ($(k + 'V').textContent = fmt[k](el.value));
+  el.addEventListener('input', () => { upd(); send({ [k]: +el.value }); });
+  upd();
+}
+// sequencer grid
+const grid = $('steps');
+steps.forEach((s, i) => {
+  const d = document.createElement('div'); d.className = 'step';
+  d.innerHTML = `<input type="range" min="0" max="24" step="1" value="${s.note}" aria-label="step ${i + 1} note"><span class="n">${noteName(s.note)}</span><button class="on">on</button>`;
+  const r = d.querySelector('input'), n = d.querySelector('.n'), b = d.querySelector('button');
+  r.oninput = () => { s.note = +r.value; n.textContent = noteName(s.note); send({ steps }); };
+  b.onclick = () => { s.on = !s.on; b.classList.toggle('on', s.on); b.textContent = s.on ? 'on' : 'off'; send({ steps }); };
+  grid.appendChild(d);
+});
+const stepEls = [...grid.children];
+
+async function start() {
+  $('go').disabled = true; $('status').textContent = 'Solving operating points…';
+  ctx ||= new AudioContext({ sampleRate: 48000, latencyHint: 'playback' });
+  await ctx.audioWorklet.addModule(new URL('./worklet.js', import.meta.url));
+  node = new AudioWorkletNode(ctx, 'moog-patch', { outputChannelCount: [2], processorOptions: { quality: $('quality').value, params: params() } });
+  node.port.onmessage = e => {
+    const m = e.data;
+    if (m.ready) { $('status').textContent = `Running at ${ctx.sampleRate / 1000} kHz (start-up solve ${m.initMs} ms)`; $('go').disabled = false; $('go').textContent = 'Stop'; }
+    if (m.step !== undefined) stepEls.forEach((el, i) => el.classList.toggle('now', i === m.step));
+    if (m.load !== undefined) {
+      $('cpu').style.width = Math.min(100, m.load * 100) + '%';
+      $('cpu').style.background = m.load > 0.9 ? 'var(--accent)' : 'var(--on)';
+      $('cpuv').textContent = Math.round(m.load * 100) + '%' + (m.load > 0.95 ? ' (too slow: try Eco)' : '');
+      draw(m.scope, m.env);
+    }
+  };
+  node.connect(ctx.destination);
+  await ctx.resume();
+}
+function stop() { node?.port.postMessage({ stop: true }); node?.disconnect(); node = null; $('go').textContent = 'Start'; $('status').textContent = 'Stopped'; stepEls.forEach(el => el.classList.remove('now')); }
+$('go').onclick = () => (node ? stop() : start());
+$('quality').onchange = () => { if (node) { stop(); start(); } };
+
+function draw(a, env) {
   const c = $('scope'), g = c.getContext('2d'), W = c.width, H = c.height, css = getComputedStyle(document.documentElement);
   g.clearRect(0, 0, W, H);
-  const cols = W, per = out.length / cols;
-  g.fillStyle = css.getPropertyValue('--accent');
-  for (let x = 0; x < cols; x++) {
-    let lo = 1, hi = -1;
-    for (let i = Math.floor(x * per); i < Math.floor((x + 1) * per); i++) { lo = Math.min(lo, out[i]); hi = Math.max(hi, out[i]); }
-    g.fillRect(x, H / 2 - hi * H / 2, 1, Math.max(1, (hi - lo) * H / 2));
-  }
+  // trigger on a rising zero crossing for a stable picture
+  let s = 0; for (let i = 1; i < 1024; i++) if (a[i - 1] <= 0 && a[i] > 0) { s = i; break; }
+  const n = 1024, sc = 0.45 * H / Math.max(0.05, ...a.map(Math.abs));
   g.strokeStyle = css.getPropertyValue('--cv'); g.lineWidth = 3; g.beginPath();
-  for (let x = 0; x < cols; x++) { const v = cv[Math.floor(x * per)]; const y = H - 8 - v / 10.5 * (H - 16); x ? g.lineTo(x, y) : g.moveTo(x, y); }
+  for (let i = 0; i < n; i++) { const y = H - 10 - env[s + i] / 7 * (H - 20); i ? g.lineTo(i * W / n, y) : g.moveTo(0, y); }
+  g.stroke();
+  g.strokeStyle = css.getPropertyValue('--accent'); g.lineWidth = 3; g.beginPath();
+  for (let i = 0; i < n; i++) { const y = H / 2 - a[s + i] * sc; i ? g.lineTo(i * W / n, y) : g.moveTo(0, y); }
   g.stroke();
 }
 </script>

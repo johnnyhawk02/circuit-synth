@@ -1,5 +1,6 @@
 // node test/run-tests.mjs  — checks each module against hand-calculated values
 import { mixer, lfo, vca } from '../src/modules.js';
+import { vco, Filter904A, vca902, env911 } from '../src/moog.js';
 
 const SR = 48000;
 let fails = 0;
@@ -59,6 +60,67 @@ const check = (name, ok, detail) => {
     `0.5V in -> ${small.toFixed(3)} V, 5V in -> ${big.toFixed(3)} V`);
   const s = v.circuit.stats;
   console.log(`      vca: ${(s.iters / s.steps).toFixed(2)} Newton iters/step, ${s.failures} non-converged`);
+}
+
+// --- VCO: 1 V/oct tracking (period from rising zero crossings of the saw about its mean)
+{
+  const o = vco(SR);
+  const freq = cv => {
+    const n = SR / 2, buf = new Float64Array(n);
+    for (let i = 0; i < n; i++) buf[i] = o.process({ cv }).saw;
+    let mean = 0; for (let i = n / 2; i < n; i++) mean += buf[i]; mean /= n / 2;
+    const xs = [];
+    for (let i = n / 2 + 1; i < n; i++) if (buf[i - 1] < mean && buf[i] >= mean) xs.push(i);
+    return (xs.length - 1) * SR / (xs[xs.length - 1] - xs[0]);
+  };
+  const f0 = freq(0), f1 = freq(1), f2 = freq(2);
+  const c1 = 1200 * Math.log2(f1 / f0 / 2), c2 = 1200 * Math.log2(f2 / f1 / 2);
+  check('vco 1 V/oct', Math.abs(c1) < 25 && Math.abs(c2) < 25,
+    `${f0.toFixed(1)} / ${f1.toFixed(1)} / ${f2.toFixed(1)} Hz, octave error ${c1.toFixed(1)}, ${c2.toFixed(1)} cents`);
+}
+
+// --- 904A: passes low frequencies, attenuates far above cutoff (24 dB/oct)
+{
+  const amp = f => {
+    const fl = new Filter904A(SR);
+    fl.setCutoff(0.5);
+    const n = SR / 2, ys = new Float64Array(n);
+    for (let i = 0; i < n; i++) ys[i] = fl.process(0.1 * Math.sin(2 * Math.PI * f * i / SR));
+    let mean = 0, peak = 0;
+    for (let i = n / 2; i < n; i++) mean += ys[i]; mean /= n / 2;
+    for (let i = n / 2; i < n; i++) peak = Math.max(peak, Math.abs(ys[i] - mean));
+    return peak;
+  };
+  const lo = amp(50), hi = amp(1600);
+  const db = 20 * Math.log10(hi / lo);
+  check('904A low-pass rolloff', db < -40, `50 Hz ${lo.toFixed(4)} V, 1.6 kHz ${hi.toFixed(5)} V (${db.toFixed(1)} dB)`);
+}
+
+// --- 902: gain grows exponentially with control voltage
+{
+  const m = vca902(SR);
+  const amp = cv => {
+    let peak = 0, mean = 0;
+    const n = SR / 5, ys = new Float64Array(n);
+    for (let i = 0; i < n; i++) ys[i] = m.process({ in: 0.5 * Math.sin(2 * Math.PI * 440 * i / SR), cv1: cv }).o12;
+    for (let i = n / 2; i < n; i++) mean += ys[i]; mean /= n / 2;
+    for (let i = n / 2; i < n; i++) peak = Math.max(peak, Math.abs(ys[i] - mean));
+    return peak;
+  };
+  const a1 = amp(1), a2 = amp(2), a3 = amp(3);
+  check('902 exponential gain', a2 / a1 > 2 && a3 / a2 > 2, `cv 1/2/3 V -> ${a1.toFixed(4)} / ${a2.toFixed(4)} / ${a3.toFixed(4)} V`);
+}
+
+// --- 911: attack rises, settles to sustain, releases to ~0
+{
+  const e = env911(SR);
+  e.setAttack(0.1); e.setDecay(0.3); e.setSustain(0.5); e.setRelease(0.1);
+  const run = secs => { let y = 0, pk = 0; for (let i = 0; i < secs * SR / e.decimate; i++) { y = e.process({}).out; pk = Math.max(pk, y); } return [y, pk]; };
+  const [idle] = run(0.1);
+  e.gate(true); const [held, peak] = run(1.5);
+  e.gate(false); const [rel] = run(1.5);
+  check('911 envelope ADSR shape', peak > 4 && held < peak * 0.8 && held > 1 && Math.abs(rel) < 0.2 && Math.abs(idle) < 0.2,
+    `idle ${idle.toFixed(3)}, peak ${peak.toFixed(2)}, sustain ${held.toFixed(2)}, released ${rel.toFixed(3)} V`);
 }
 
 console.log(fails ? `\n${fails} test(s) failed` : '\nall tests passed');

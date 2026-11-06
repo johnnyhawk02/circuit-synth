@@ -1,51 +1,65 @@
 # Component-level synth prototype (JS)
 
-Every module is a real schematic written as a netlist and solved sample by sample:
-Modified Nodal Analysis + Newton-Raphson, trapezoidal capacitors, 4x oversampling.
-No DSP shortcuts inside the modules.
+Every module is a real schematic written as a netlist and solved sample by sample in real time.
+No DSP shortcuts inside the modules: resistors, capacitors, transistors, JFETs, diodes and
+op-amp macro-models, nothing else.
 
 ## Live demo
 
 GitHub Pages serves the browser demo from the repo root (`index.html` redirects to `demo/`).
 
+- `demo/index.html` – **live Moog patch**: 8-step sequencer → VCO → 904A ladder filter →
+  902 VCA, with a 911 envelope on the VCA and (through an attenuator) on the filter.
+  Runs in an AudioWorklet; every knob changes a real component value (pot position, cap value).
+- `demo/lfo-vca.html` – the earlier LFO → diff-pair VCA demo.
+
+Quality: **Eco** (VCO 2x oversampled, filter 1x) runs at roughly 85% of one core on a
+2.1 GHz server Xeon, so a recent laptop has headroom. **HQ** (4x / 2x) costs about twice that.
+
 ## Run
 
 ```
-node test/run-tests.mjs      # checks each module against hand-calculated values
-node test/render-wav.mjs     # writes demo/patch.wav (LFO -> VCA patch, 3 s)
-python3 -m http.server       # then open http://localhost:8000/demo/
+node test/run-tests.mjs        # checks each module against hand-calculated values
+node test/render-moog.mjs 4    # writes demo/moog.wav (the live patch, 4 s, offline)
+node test/render-wav.mjs       # writes demo/patch.wav (old LFO -> VCA patch)
+python3 -m http.server         # then open http://localhost:8000/demo/
 ```
-The browser demo needs a local server (ES modules don't load from file://).
+The browser demo needs a local server (ES modules and worklets don't load from file://).
 
 ## Files
 
-- `src/solver.js` – the circuit engine. Parts: R, C, V (settable inputs), diode (Shockley),
-  NPN/PNP (Ebers-Moll), op-amp (tanh rail-clipping macro-model with input offset).
-  Junction voltage limiting, Newton damping, automatic half-step retry when a step fails.
-- `src/modules.js` – the schematics:
-  - **mixer**: 3-input inverting op-amp summer, 100k resistors.
-  - **lfo**: op-amp integrator + Schmitt trigger. f = R3 / (4·Rrate·C·R2) = 5 Hz at 100k / 1 µF.
-  - **vca**: discrete BJT differential pair, op-amp CV-to-tail-current, op-amp difference amp.
-- `src/patch.js` – patches them: LFO triangle -> VCA CV, sine -> VCA -> mixer.
+- `src/solver.js` – the circuit engine, DK-method style: the linear network is folded into
+  precomputed matrices per step size, and Newton runs only on the nonlinear port voltages.
+  Parts: R, POT, C (trapezoidal or backward Euler per cap), V (settable inputs), diode, NPN/PNP
+  (Ebers–Moll, or a cheaper forward-only model; optional junction capacitance), JFET (saturation
+  and a triode switch), op-amp (tanh rail clip, or a gain-bandwidth pole + slew limit for
+  comparators). Sub-stepping (h/2…h/256, cached matrices) on failed steps and while a watched
+  node is mid-transition; linear predictor for the port voltages.
+- `src/modules.js` – mixer, LFO, diff-pair VCA (first prototypes).
+- `src/moog.js` – the Moog modules, from the original service drawings:
+  - **vco**: exponential converter (matched pair + reference op-amp), integrator, JFET reset,
+    Schmitt comparator. Generic saw core (the 921 uses ICs we don't model yet). 1 V/oct within
+    ~10 cents over three octaves, falls flat at the top (−97 cents at C7).
+  - **Filter904A**: input buffer Q22/Q23, adder + Q6 exponential converter, the 4-pole ladder
+    Q7–Q16 (bias chain 680/220/220/220/68 Ω, range caps 1.2 / 0.3 / 0.075 µF), output buffer
+    Q17–Q21. DC points match the drawing's annotations within ~0.1 V.
+  - **vca902**: adder, Q10 exponential converter, Q6–Q9 gain cell, Q11/Q12 PNP output pair,
+    Q13 current source. `trimBias()` sets OUTPUT BIAS like the service procedure.
+  - **env911**: 10 µF timing cap, 1 MΩ attack/decay/release pots, JFET buffer, discrete
+    transistor flip-flop (Q9–Q14). Zero trim set automatically.
+- `src/voice.js` – the patch and step sequencer, shared by the worklet and the offline renderer.
 
-## Adding a module
+## Assumptions (things the drawings don't settle)
 
-```js
-const c = new Circuit();
-c.V('vcc', '0', 12); c.V('vee', '0', -12);
-c.V('in_src', '0', 0, 'in');          // named input you set each sample
-c.R('in_src', 'n1', 10e3);
-c.NPN('col', 'base', 'emit');        // c, b, e
-c.OPAMP('plus', 'minus', 'out');
-new Module(c, ['in'], ['out'], 48000, 4);
-```
+- 904A regeneration is fed back from the output pair (Q20 collector) through C8 into R22.
+- 904A modules are solved as three circuits joined at transistor bases; the ladder sees the
+  adder's output as an ideal source (the loading there is one base current).
+- 911 flip-flop transistors get 1 nF junction capacitance so the latch flips in a few sub-steps.
+- A 4.7 µF patch-cable coupling cap in front of the 904A (the VCO saw sits on a DC offset).
+- The VCO is a generic expo/integrator/Schmitt core, not a 921 copy.
 
 ## Known limits / next steps
 
-- Speed: ~1.1x real time in Node for LFO + VCA + mixer, dominated by the dense LU solve.
-  Next: DK method (precompute the linear part, iterate only on nonlinear ports) or sparse LU.
-- The Schmitt trigger's regenerative flip has no continuous solution with an ideal-bandwidth
-  op-amp; ~5 steps per second don't fully converge but the waveform is correct (5.004 Hz measured).
-  Next: add gain-bandwidth to the op-amp model.
-- Modules are solved separately and joined by ideal voltage ports (no loading between them).
-- Next modules from the schematic guide: Thomas Henry VCO-1 core, Moog transistor ladder, ADSR.
+- Each module is solved separately and joined by ideal voltage ports (no loading between modules).
+- Speed: a single patch takes most of a core; a VST port (C++/SIMD) should be ~10x faster.
+- VCO high-frequency tracking needs a bulk-resistance compensation like the real 921.
