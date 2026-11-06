@@ -13,21 +13,26 @@ function rails(c) {
 // Runs a circuit at sampleRate * oversample, holds inputs across sub-steps,
 // and averages the outputs back down (a crude but safe decimator).
 export class Module {
-  constructor(circuit, inputs, outputs, sampleRate, oversample = 4) {
+  // init: 'dc' solves the DC operating point first; 'zero' starts with every capacitor
+  // discharged (needed for oscillators, whose DC point is an unstable balance).
+  constructor(circuit, inputs, outputs, sampleRate, oversample = 4, { init = 'dc' } = {}) {
     Object.assign(this, { circuit, inputs, outputs, oversample });
+    circuit.probe(...outputs);
     circuit.finalize(sampleRate * oversample);
-    circuit.dcop();
+    if (init === 'dc') circuit.dcop();
     this.out = Object.fromEntries(outputs.map(o => [o, 0]));
+    this.idx = outputs.map(o => circuit.nodeIndex.get(o));
+    this.acc = new Float64Array(outputs.length);
   }
   process(inValues = {}) {
-    const c = this.circuit;
+    const c = this.circuit, n = this.idx.length, acc = this.acc;
     for (const k of this.inputs) if (k in inValues) c.set(k, inValues[k]);
-    for (const o of this.outputs) this.out[o] = 0;
+    acc.fill(0);
     for (let s = 0; s < this.oversample; s++) {
       c.step();
-      for (const o of this.outputs) this.out[o] += c.v(o);
+      for (let j = 0; j < n; j++) acc[j] += c.vNode(this.idx[j]);
     }
-    for (const o of this.outputs) this.out[o] /= this.oversample;
+    for (let j = 0; j < n; j++) this.out[this.outputs[j]] = acc[j] / this.oversample;
     return this.out;
   }
 }
@@ -60,9 +65,9 @@ export function lfo(sampleRate, { rate = 100e3, cap = 1e-6, oversample = 4 } = {
   c.R('tri', 'sch_p', 10e3);
   c.R('sq', 'sch_p', 20e3);
   // 1 mV input offset (real op-amps have one) breaks the symmetric start-up state
-  c.OPAMP('sch_p', '0', 'sq', { vos: 1e-3 });
-  const m = new Module(c, [], ['tri', 'sq'], sampleRate, oversample);
-  m.setRate = ohms => { rRate.g = 1 / ohms; c.invalidate(); };
+  c.OPAMP('sch_p', '0', 'sq', { vos: 1e-3, gbw: 90e3, slew: 0.5e6 }); // slow pole: see OPAMP gbw note
+  const m = new Module(c, [], ['tri', 'sq'], sampleRate, oversample, { init: 'zero' });
+  m.setRate = ohms => rRate.set(ohms);
   return m;
 }
 
