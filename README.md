@@ -13,8 +13,9 @@ GitHub Pages serves the browser demo from the repo root (`index.html` redirects 
   Runs in an AudioWorklet; every knob changes a real component value (pot position, cap value).
 - `demo/lfo-vca.html` – the earlier LFO → diff-pair VCA demo.
 
-Quality: **Eco** (VCO 2x oversampled, filter 1x) runs at roughly 85% of one core on a
-2.1 GHz server Xeon, so a recent laptop has headroom. **HQ** (4x / 2x) costs about twice that.
+Quality: **Eco** (VCO 2x oversampled, filter 1x) runs at roughly 50% of one core on a
+2.1 GHz server Xeon (headless Chrome), so a recent laptop has plenty of headroom. **HQ** (4x / 2x)
+runs at about 85%.
 
 ## Run
 
@@ -35,6 +36,13 @@ The browser demo needs a local server (ES modules and worklets don't load from f
   and a triode switch), op-amp (tanh rail clip, or a gain-bandwidth pole + slew limit for
   comparators). Sub-stepping (h/2…h/256, cached matrices) on failed steps and while a watched
   node is mid-transition; linear predictor for the port voltages.
+- `kernel/kernel.c` – the per-sample hot path (Newton on the port voltages, port models,
+  capacitor update) in plain C, compiled to WebAssembly with SIMD; about 1.7x faster than the
+  same code in JavaScript, and reusable as-is in a C++ plugin. `sh kernel/build.sh` rebuilds
+  it (needs clang with the wasm32 target) and embeds it in `src/kernel-wasm.js`, which
+  `src/kernel.js` instantiates synchronously, so nothing else changes for Node or the worklet.
+  Ports whose slope is negligible (a cut-off transistor, an idle clamp) are left out of the
+  factorisation, which makes the 911's 25-port flip-flop circuit about 35% cheaper.
 - `src/modules.js` – mixer, LFO, diff-pair VCA (first prototypes).
 - `src/moog.js` – the Moog modules, from the original service drawings:
   - **vco**: exponential converter (matched pair + reference op-amp), integrator, JFET reset,
@@ -61,5 +69,6 @@ The browser demo needs a local server (ES modules and worklets don't load from f
 ## Known limits / next steps
 
 - Each module is solved separately and joined by ideal voltage ports (no loading between modules).
-- Speed: a single patch takes most of a core; a VST port (C++/SIMD) should be ~10x faster.
+- Speed: the patch takes about half a core. The kernel is already C; a native plugin would
+  also move the matrix building and the module glue out of JavaScript.
 - VCO high-frequency tracking needs a bulk-resistance compensation like the real 921.
